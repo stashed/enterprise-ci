@@ -1,0 +1,190 @@
+# Usage: /ok-to-test [k8s-version]
+# Examples:
+# /ok-to-test
+# /ok-to-test v1.18.4
+
+name: e2e
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  build:
+    if: contains(github.event.issue.html_url, '/pull/') && startsWith(github.event.comment.body, '/ok-to-test')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: crazy-max/ghaction-docker-buildx@v1
+        with:
+          buildx-version: latest
+          qemu-version: latest
+
+      - name: Checkout pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          curl -fsSL https://github.com/github/hub/raw/master/script/get | bash -s 2.14.1
+          sudo mv bin/hub /usr/local/bin
+          hub pr checkout $PR_NUMBER
+
+      - name: Login Docker
+        env:
+          GCR_SERVICE_ACCOUNT_JSON_KEY: ${{ secrets.CI_GCR_SERVICE_ACCOUNT_JSON_KEY }}
+        run: |
+          # echo "install gcloud cli"
+          # echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+          # curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
+          # sudo apt-get -qq update
+          # sudo apt-get install -y google-cloud-sdk
+          # echo
+          echo "configure gcloud auth"
+          echo "$GCR_SERVICE_ACCOUNT_JSON_KEY" > "$HOME"/gcr.json
+          gcloud auth activate-service-account --key-file=$HOME/gcr.json
+          echo
+          echo "configure docker auth"
+          gcloud auth configure-docker -q
+
+      - name: Build
+        env:
+          REGISTRY: gcr.io/appscode-ci
+          GITHUB_USER: 1gtm
+          GITHUB_TOKEN: ${{ secrets.LGTM_GITHUB_TOKEN }}
+        run: |
+          # https://stackoverflow.com/a/30969768/244009
+          set -o allexport
+          source event.env
+          set +o allexport
+          # check out code
+          cd ..
+          git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@$PR_REPO_URL.git
+          cd $(basename $PR_REPO_URL)
+          git checkout $PR_HEAD_REF
+          git reset --hard $PR_HEAD_SHA
+          make push
+
+  config:
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        name: Generate test matrix
+        run: |
+          k8s=(v1.14.10 v1.16.9 v1.18.8 v1.19.1)
+
+          IFS=' '
+          read -ra COMMENT <<< "${{ github.event.comment.body }}"
+          if [ ! -z ${COMMENT[1]} ]; then
+            k8s=(${COMMENT[1]})
+          fi
+
+          matrix=()
+          for x in ${k8s[@]}; do
+            matrix+=( $( jq -n -c --arg x "$x" '{"k8s":$x}' ) )
+          done
+
+          # https://stackoverflow.com/a/63046305/244009
+          function join { local IFS="$1"; shift; echo "$*"; }
+          matrix=$(echo "{"include":[$(join , ${matrix[@]})]}")
+          echo $matrix
+          echo "::set-output name=matrix::$matrix"
+
+  kubernetes:
+    name: Kubernetes
+    needs: config
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.config.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Checkout pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          curl -fsSL https://github.com/github/hub/raw/master/script/get | bash -s 2.14.1
+          sudo mv bin/hub /usr/local/bin
+          hub pr checkout $PR_NUMBER
+
+      - name: Create Kubernetes ${{ matrix.k8s }} cluster
+        id: kind
+        uses: engineerd/setup-kind@v0.5.0
+        with:
+          version: v0.9.0
+          config: hack/kubernetes/kind.yaml
+          image: kindest/node:${{ matrix.k8s }}
+
+      - name: Prepare cluster for testing
+        id: local-path
+        env:
+          USERNAME: 1gtm
+          REGISTRY_SECRET: regcred
+          GCR_SERVICE_ACCOUNT_JSON_KEY: ${{ secrets.CI_GCR_SERVICE_ACCOUNT_JSON_KEY }}
+        run: |
+          echo "waiting for nodes to be ready ..."
+          kubectl wait --for=condition=Ready nodes --all --timeout=5m
+          kubectl get nodes
+          echo
+          echo "install helm 3"
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+          echo
+          echo "create docker-registry secret"
+          kubectl create secret docker-registry ${REGISTRY_SECRET} \
+            --namespace=kube-system \
+            --docker-server=https://gcr.io \
+            --docker-username=_json_key \
+            --docker-email=${USERNAME}@appscode.com \
+            --docker-password="$(echo $GCR_SERVICE_ACCOUNT_JSON_KEY)"
+
+      - name: Install NFS server dependencies
+        run: |
+          nodes=$(kubectl get nodes -o=jsonpath='{range .items[*]}{.metadata.name}{"\t"}{end}')
+          for i in $nodes
+          do
+            echo "Installing NFS server dependencies in node: $i ...."
+            docker exec $i apt-get update
+            docker exec $i apt-get install -y nfs-kernel-server
+          done
+
+      - name: Check out installer
+        run: |
+          cd ..
+          git clone https://github.com/stashed/installer.git
+          cd installer
+          git checkout master
+
+      - name: Run e2e tests
+        env:
+          REGISTRY: gcr.io/appscode-ci
+          REGISTRY_SECRET: regcred
+          TEST_CREDENTIALS: ${{ secrets.TEST_CREDENTIALS }}
+          GOOGLE_SERVICE_ACCOUNT_JSON_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_KEY }}
+          GITHUB_USER: 1gtm
+          GITHUB_TOKEN: ${{ secrets.LGTM_GITHUB_TOKEN }}
+        run: |
+          # https://stackoverflow.com/a/30969768/244009
+          set -o allexport
+          source event.env
+          set +o allexport
+          # check out code
+          cd ..
+          git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@${PR_REPO_URL}.git
+          cd $(basename $PR_REPO_URL)
+          git checkout $PR_HEAD_REF
+          git reset --hard $PR_HEAD_SHA
+          echo "preparing test credentials"
+          mkdir -p hack/config
+          echo -n "$TEST_CREDENTIALS" > hack/config/.env
+          echo >> hack/config/.env
+          echo "GOOGLE_SERVICE_ACCOUNT_JSON_KEY=$(echo $GOOGLE_SERVICE_ACCOUNT_JSON_KEY)" >> hack/config/.env
+          make install
+          echo
+          sleep 10
+          make e2e-parallel
