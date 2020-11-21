@@ -47,6 +47,15 @@ jobs:
           echo $matrix
           echo "::set-output name=matrix::$matrix"
 
+      - name: Checkout pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          curl -fsSL https://github.com/github/hub/raw/master/script/get | bash -s 2.14.1
+          sudo mv bin/hub /usr/local/bin
+          hub pr checkout $PR_NUMBER
+
       - name: Login Docker
         env:
           DOCKER_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -68,7 +77,8 @@ jobs:
           cd ..
           git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@$PR_REPO_URL.git
           cd $(basename $PR_REPO_URL)
-          git checkout $PR_HEAD_SHA
+          git checkout $PR_HEAD_REF
+          git reset --hard $PR_HEAD_SHA
           make push
 
   kubernetes:
@@ -147,7 +157,8 @@ jobs:
           cd ..
           git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@${PR_REPO_URL}.git
           cd $(basename $PR_REPO_URL)
-          git checkout $PR_HEAD_SHA
+          git checkout $PR_HEAD_REF
+          git reset --hard $PR_HEAD_SHA
           echo "preparing test credentials"
           mkdir -p hack/config
           echo -n "$TEST_CREDENTIALS" > hack/config/.env
